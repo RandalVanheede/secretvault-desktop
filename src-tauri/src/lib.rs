@@ -1366,7 +1366,154 @@ fn keychain_available() -> bool {
         return Command::new("security").arg("-h").output().is_ok();
     }
 
+    // On Linux: secret-tool OR file-based fallback (always available)
+    true
+}
+
+fn secret_tool_available() -> bool {
     Command::new("secret-tool").arg("--help").output().is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// File-based fallback for Linux systems without libsecret/secret-tool.
+// Encrypts master password using a key derived from machine-id.
+// ---------------------------------------------------------------------------
+
+fn keyfile_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config"))
+        .join("ddev-secret-vault")
+}
+
+fn keyfile_path() -> PathBuf {
+    keyfile_dir().join("keyfile")
+}
+
+fn get_machine_key() -> String {
+    let machine_id = std::fs::read_to_string("/etc/machine-id")
+        .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+        .unwrap_or_else(|_| {
+            format!(
+                "{}-{}",
+                hostname::get()
+                    .map(|h| h.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "unknown".to_string()),
+                unsafe { libc::getuid() }
+            )
+        })
+        .trim()
+        .to_string();
+
+    // Derive key using openssl (same as shell version)
+    let output = Command::new("openssl")
+        .args(["dgst", "-sha256", "-binary"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(format!("ddev-secret-vault:{}", machine_id).as_bytes())
+                .ok();
+            child.wait_with_output()
+        })
+        .map(|o| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&o.stdout)
+        })
+        .unwrap_or_default();
+
+    output
+}
+
+fn keyfile_load() -> Option<String> {
+    let path = keyfile_path();
+    if !path.exists() {
+        return None;
+    }
+    let key = get_machine_key();
+    let output = Command::new("openssl")
+        .args([
+            "enc",
+            "-d",
+            "-aes-256-cbc",
+            "-pbkdf2",
+            "-iter",
+            "10000",
+            "-in",
+        ])
+        .arg(&path)
+        .arg("-pass")
+        .arg(format!("pass:{}", key))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let password = String::from_utf8_lossy(&output.stdout).to_string();
+    if password.is_empty() {
+        None
+    } else {
+        Some(password)
+    }
+}
+
+fn keyfile_save(password: &str) -> Result<(), String> {
+    let dir = keyfile_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create keyfile dir: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).ok();
+    }
+    let path = keyfile_path();
+    let key = get_machine_key();
+
+    let mut child = Command::new("openssl")
+        .args([
+            "enc",
+            "-aes-256-cbc",
+            "-pbkdf2",
+            "-iter",
+            "10000",
+            "-salt",
+            "-out",
+        ])
+        .arg(&path)
+        .arg("-pass")
+        .arg(format!("pass:{}", key))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to encrypt keyfile: {e}"))?;
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "Failed to write to openssl stdin".to_string())?
+            .write_all(password.as_bytes())
+            .map_err(|e| format!("Failed to write password: {e}"))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to finish openssl: {e}"))?;
+    if !status.success() {
+        return Err("openssl encryption failed".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).ok();
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn keyfile_delete() {
+    let _ = fs::remove_file(keyfile_path());
 }
 
 fn load_password_from_keychain() -> Option<String> {
@@ -1393,7 +1540,11 @@ fn load_password_from_keychain() -> Option<String> {
         };
     }
 
-    let output = Command::new("secret-tool")
+    if !secret_tool_available() {
+        return keyfile_load();
+    }
+
+    let output = match Command::new("secret-tool")
         .args([
             "lookup",
             "application",
@@ -1402,13 +1553,17 @@ fn load_password_from_keychain() -> Option<String> {
             KEYCHAIN_ACCOUNT,
         ])
         .output()
-        .ok()?;
+    {
+        Ok(o) => o,
+        Err(_) => return keyfile_load(),
+    };
     if !output.status.success() {
-        return None;
+        // Fall back to file-based storage
+        return keyfile_load();
     }
     let password = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if password.is_empty() {
-        None
+        keyfile_load()
     } else {
         Some(password)
     }
@@ -1429,7 +1584,7 @@ fn save_password_to_keychain(password: &str) -> Result<(), String> {
             ])
             .status()
             .map_err(|err| format!("Failed to update macOS Keychain: {err}"))?
-    } else {
+    } else if secret_tool_available() {
         let mut child = Command::new("secret-tool")
             .args([
                 "store",
@@ -1454,6 +1609,9 @@ fn save_password_to_keychain(password: &str) -> Result<(), String> {
         child
             .wait()
             .map_err(|err| format!("Failed to finish libsecret command: {err}"))?
+    } else {
+        // File-based fallback
+        return keyfile_save(password);
     };
 
     if status.success() {
