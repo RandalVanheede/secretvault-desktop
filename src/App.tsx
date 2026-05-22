@@ -113,6 +113,7 @@ function App() {
   const [importPreview, setImportPreview] = useState<ImportPreview | null>(null);
   const [cleanPreview, setCleanPreview] = useState<CleanPreview | null>(null);
   const [cleanOnImport, setCleanOnImport] = useState(false);
+  const [skipHashSalt, setSkipHashSalt] = useState(false);
 
   useEffect(() => {
     void loadBootstrap();
@@ -485,6 +486,7 @@ function App() {
           project: selectedProject,
           path: selectedImportPath,
           clean: cleanOnImport,
+          skipHashSalt,
         },
       });
       setVault(result.vault);
@@ -882,6 +884,14 @@ function App() {
                     type="checkbox"
                   />
                   Clean source file after import and create a `.bak` backup
+                </label>
+                <label className="checkbox-row">
+                  <input
+                    checked={skipHashSalt}
+                    onChange={(event) => setSkipHashSalt(event.currentTarget.checked)}
+                    type="checkbox"
+                  />
+                  Skip <code>DRUPAL_HASH_SALT</code> (do not import the Drupal hash salt)
                 </label>
                 {importPreview ? (
                   <div className="preview-card">

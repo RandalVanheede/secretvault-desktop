@@ -177,6 +177,8 @@ struct ImportApplyPayload {
     project: String,
     path: String,
     clean: bool,
+    #[serde(default)]
+    skip_hash_salt: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -583,7 +585,7 @@ fn find_import_candidates(project_path: String) -> Result<Vec<ImportCandidate>, 
 
 #[tauri::command]
 fn preview_import(payload: ImportPreviewPayload) -> Result<ImportPreview, String> {
-    let parsed = parse_import_file(Path::new(&payload.path))?;
+    let parsed = parse_import_file(Path::new(&payload.path), false)?;
     Ok(ImportPreview {
         path: payload.path,
         kind: import_kind_name(&parsed.kind).to_string(),
@@ -624,8 +626,25 @@ fn apply_import(
     let vault_path = vault_path(&payload.project)?;
     let mut data = decrypt_vault(&vault_path, &password)?;
     let source_path = PathBuf::from(&payload.path);
-    let parsed = parse_import_file(&source_path)?;
+    let parsed = parse_import_file(&source_path, payload.skip_hash_salt)?;
     let now = iso_now();
+
+    // If skip_hash_salt is set, also remove any existing DRUPAL_HASH_SALT variants from the vault.
+    if payload.skip_hash_salt {
+        if let Some(secrets_obj) = data["secrets"].as_object_mut() {
+            let keys_to_remove: Vec<String> = secrets_obj
+                .keys()
+                .filter(|k| *k == "DRUPAL_HASH_SALT" || k.ends_with("__DRUPAL_HASH_SALT"))
+                .cloned()
+                .collect();
+            for k in &keys_to_remove {
+                secrets_obj.remove(k);
+                if let Some(meta) = data["metadata"].as_object_mut() {
+                    meta.remove(k);
+                }
+            }
+        }
+    }
 
     for secret in &parsed.secrets {
         ensure_object(&mut data, "secrets")?
@@ -743,7 +762,7 @@ fn collect_settings_local_candidates(
     Ok(())
 }
 
-fn parse_import_file(path: &Path) -> Result<ParsedImport, String> {
+fn parse_import_file(path: &Path, skip_hash_salt: bool) -> Result<ParsedImport, String> {
     if !path.exists() {
         return Err(format!("Import file not found: {}", path.display()));
     }
@@ -751,7 +770,7 @@ fn parse_import_file(path: &Path) -> Result<ParsedImport, String> {
     let original_content = fs::read_to_string(path)
         .map_err(|err| format!("Failed to read {}: {err}", path.display()))?;
     if path.extension().and_then(|ext| ext.to_str()) == Some("php") {
-        let secrets = parse_php_secrets(&original_content, path);
+        let secrets = parse_php_secrets(&original_content, path, skip_hash_salt);
         return Ok(ParsedImport {
             kind: ImportKind::Php,
             source_label: path
@@ -817,7 +836,7 @@ fn parse_env_secrets(content: &str) -> Result<Vec<ParsedSecret>, String> {
     Ok(secrets)
 }
 
-fn parse_php_secrets(content: &str, path: &Path) -> Vec<ParsedSecret> {
+fn parse_php_secrets(content: &str, path: &Path, skip_hash_salt: bool) -> Vec<ParsedSecret> {
     let mut secrets = std::collections::BTreeMap::<String, String>::new();
     let subsite_prefix = path
         .parent()
@@ -832,7 +851,7 @@ fn parse_php_secrets(content: &str, path: &Path) -> Vec<ParsedSecret> {
             continue;
         }
 
-        if trimmed.contains("hash_salt") {
+        if !skip_hash_salt && trimmed.contains("hash_salt") {
             if let Some(value) = extract_quoted_value(trimmed) {
                 secrets.insert("DRUPAL_HASH_SALT".to_string(), value);
             }
