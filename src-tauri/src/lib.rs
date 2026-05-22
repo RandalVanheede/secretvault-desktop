@@ -604,7 +604,7 @@ fn preview_import(payload: ImportPreviewPayload) -> Result<ImportPreview, String
 #[tauri::command]
 fn preview_clean_import_source(payload: ImportPreviewPayload) -> Result<CleanPreview, String> {
     let path = PathBuf::from(&payload.path);
-    let parsed = parse_import_file(&path)?;
+    let parsed = parse_import_file(&path, false)?;
     let (cleaned_content, diff) = match parsed.kind {
         ImportKind::Env => clean_env_content(&parsed.original_content),
         ImportKind::Php => clean_php_content(&parsed.original_content, &parsed.secrets),
@@ -631,17 +631,21 @@ fn apply_import(
 
     // If skip_hash_salt is set, also remove any existing DRUPAL_HASH_SALT variants from the vault.
     if payload.skip_hash_salt {
-        if let Some(secrets_obj) = data["secrets"].as_object_mut() {
-            let keys_to_remove: Vec<String> = secrets_obj
-                .keys()
-                .filter(|k| *k == "DRUPAL_HASH_SALT" || k.ends_with("__DRUPAL_HASH_SALT"))
-                .cloned()
-                .collect();
-            for k in &keys_to_remove {
-                secrets_obj.remove(k);
-                if let Some(meta) = data["metadata"].as_object_mut() {
-                    meta.remove(k);
-                }
+        let keys_to_remove: Vec<String> = data["secrets"]
+            .as_object()
+            .map(|obj| {
+                obj.keys()
+                    .filter(|k| *k == "DRUPAL_HASH_SALT" || k.ends_with("__DRUPAL_HASH_SALT"))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for k in &keys_to_remove {
+            if let Some(obj) = data["secrets"].as_object_mut() {
+                obj.remove(k);
+            }
+            if let Some(obj) = data["metadata"].as_object_mut() {
+                obj.remove(k);
             }
         }
     }
